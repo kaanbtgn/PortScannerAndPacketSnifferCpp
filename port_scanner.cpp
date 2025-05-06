@@ -23,6 +23,7 @@
 #include "rawsock.hpp"
 #include "checksum.hpp"
 #include <queue>
+#include <algorithm>
 #include <condition_variable>
 #include <set>
 #include <ifaddrs.h>
