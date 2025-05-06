@@ -15,6 +15,10 @@
 #include <netinet/ip.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#ifdef __linux__
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#endif
 #include <netdb.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -120,6 +124,8 @@ std::string resolve_hostname(const std::string& host) {
     return std::string(ipstr);
 }
 
+enum class PortState { OPEN, CLOSED, FILTERED };
+
 class PortScanner {
 public:
     // Capture packets on all open TCP ports
@@ -137,6 +143,7 @@ private:
     void fingerprint_os(uint16_t open_port);
     void sniff_port(uint16_t port, int duration_sec = 5);
     void send_probe(uint16_t port, const std::string& data = "HELLO\r\n");
+    void send_raw_payload(uint16_t port, const std::vector<uint8_t>& data);
 
     std::string detect_os(const OSFingerprint& fp) {
         std::vector<std::pair<std::string, int>> scores;
@@ -184,7 +191,7 @@ private:
         return "Unknown OS";
     }
 
-    bool send_syn_packet(uint16_t port) {
+    uint16_t send_syn_packet(uint16_t port) {
         RawSocket sock(IPPROTO_TCP);
         int optval = 1;
         setsockopt(sock.fd(), IPPROTO_IP, IP_HDRINCL, &optval, sizeof(optval));
@@ -222,8 +229,10 @@ private:
         inet_pton(AF_INET, local_ip, &iph->ip_src);
         iph->ip_dst = dst.sin_addr;
 
+        // choose a random ephemeral source port for SYN
+        uint16_t src_port = 40000 + (rand() % 10000);
         // TCP header with options
-        tcp->th_sport = htons(40000 + (rand() % 10000));
+        tcp->th_sport = htons(src_port);
         tcp->th_dport = htons(port);
         tcp->th_seq = htonl(0xABCDEF01);
         tcp->th_off = 5 + sizeof(TCP_OPTIONS)/4;
@@ -252,9 +261,11 @@ private:
         tcp->th_sum = checksum(cbuf, sizeof(cbuf));
 
         iph->ip_sum = checksum(iph, sizeof(struct ip));
-
-        return sendto(sock.fd(), packet, sizeof(packet), 0,
-                     reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) > 0;
+        if (sendto(sock.fd(), packet, sizeof(packet), 0,
+                   reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) > 0) {
+            return src_port;
+        }
+        return 0;
     }
 
     bool analyze_syn_ack(const uint8_t* packet, size_t size, OSFingerprint& fp) {
@@ -317,12 +328,12 @@ private:
         return true;
     }
 
-    bool check_port_response(uint16_t port, int timeout_ms = 1000) {
+    PortState check_port_response(uint16_t port, int timeout_ms = 1000) {
         // First try regular TCP connect
         int tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
         if (tcp_sock < 0) {
             std::cerr << "Failed to create TCP socket: " << strerror(errno) << std::endl;
-            return false;
+            return PortState::FILTERED;
         }
 
         struct sockaddr_in addr{};
@@ -331,7 +342,7 @@ private:
         if (inet_pton(AF_INET, target_ip.c_str(), &addr.sin_addr) <= 0) {
             std::cerr << "Invalid IP address: " << target_ip << std::endl;
             close(tcp_sock);
-            return false;
+            return PortState::FILTERED;
         }
 
         // Set non-blocking
@@ -351,24 +362,26 @@ private:
                 if (res > 0) {
                     int error = 0;
                     socklen_t len = sizeof(error);
-                    if (getsockopt(tcp_sock, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+                    if (getsockopt(tcp_sock, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
                         close(tcp_sock);
-                        return false;
+                        return PortState::FILTERED;
                     }
                     close(tcp_sock);
-                    return true;
+                    if (error == 0) return PortState::OPEN;
+                    if (error == ECONNREFUSED) return PortState::CLOSED;
+                    return PortState::FILTERED;
                 } else if (res == 0) {
-                    // Timeout
+                    // Timeout => filtered
                     close(tcp_sock);
-                    return false;
+                    return PortState::FILTERED;
                 }
             }
             close(tcp_sock);
-            return false;
+            return PortState::FILTERED;
         }
 
         close(tcp_sock);
-        return true;
+        return PortState::OPEN;
     }
 
     std::string get_service_banner(uint16_t port) {
@@ -444,7 +457,24 @@ private:
     }
 
     void scan_port(uint16_t port) {
-        bool is_open = check_port_response(port);
+        PortState state = check_port_response(port);
+        bool is_open = (state == PortState::OPEN);
+        bool is_closed = (state == PortState::CLOSED);
+        bool is_filtered = (state == PortState::FILTERED);
+        if (is_closed) {
+            // Closed: RST received
+            std::lock_guard<std::mutex> lock(results_mutex);
+            results[port] = {false, "closed", "", {}};
+            ports_scanned++;
+            return;
+        }
+        if (is_filtered) {
+            // Filtered: no response
+            std::lock_guard<std::mutex> lock(results_mutex);
+            results[port] = {false, "filtered", "", {}};
+            ports_scanned++;
+            return;
+        }
         if (is_open && !os_detected) {
             fingerprint_os(port);   // first attempt
         } else if (is_open && os_detected == false) {
@@ -458,12 +488,63 @@ private:
             banner = get_service_banner(port);
             service = identify_service(port, banner);
         }
+        // FTP and SMTP specific probes
+        if (is_open && service == "Unknown") {
+            if (port == 21) {
+                send_probe(port, "SYST\r\n");
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            } else if (port == 25) {
+                send_probe(port, "EHLO example.com\r\n");
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
+        }
         // Better banner / service probe
         if (service == "Unknown" && is_open) {
             if (banner.find("HTTP") != std::string::npos ||
                 banner.find("GET /") != std::string::npos) service = "HTTP";
             else if (banner.rfind("220", 0) == 0 && banner.find("SMTP") != std::string::npos) service = "SMTP";
             else if (banner.find("SSH-") != std::string::npos) service = "SSH";
+        }
+        // Additional protocol probes for common services
+        if (is_open) {
+            if ((port == 80 || port == 443) && service == "Unknown") {
+                send_probe(port, "HEAD / HTTP/1.0\r\nHost: " + target_ip + "\r\n\r\n");
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
+            if (port == 22 && service == "Unknown") {
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
+            if (port == 21 && service == "Unknown") {
+                send_probe(port, "SYST\r\n");
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
+            if (port == 25 && service == "Unknown") {
+                send_probe(port, "EHLO example.com\r\n");
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
+            if (port == 3306 && service == "Unknown") {
+                std::vector<uint8_t> mysql_ping = {0x0a};
+                send_raw_payload(port, mysql_ping);
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
+            if (port == 6379 && service == "Unknown") {
+                send_probe(port, "*1\r\n$4\r\nPING\r\n");
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
+            if (port == 5432 && service == "Unknown") {
+                std::vector<uint8_t> psql_ssl = {0x00,0x00,0x00,0x08,0x04,0xd2,0x16,0x2f};
+                send_raw_payload(port, psql_ssl);
+                banner = get_service_banner(port);
+                service = identify_service(port, banner);
+            }
         }
         {
             std::lock_guard<std::mutex> lock(results_mutex);
@@ -753,22 +834,43 @@ int main(int argc, char* argv[]) {
 // OS fingerprinting helper: called once per scan when first open TCP port is found
 void PortScanner::fingerprint_os(uint16_t open_port) {
     if (os_detected) return;           // already done
-    RawSocket sock(IPPROTO_TCP);       // raw receiver
-    int optval = 1;
-    setsockopt(sock.fd(), IPPROTO_IP, IP_HDRINCL, &optval, sizeof(optval));
 
-    // Send a crafted SYN with options to the open port
-    if (!send_syn_packet(open_port)) return;
+    // Send a crafted SYN with options to the open port, get src_port
+    uint16_t src_port = send_syn_packet(open_port);
+    if (!src_port) return;
+
+#ifdef __linux__
+    int recv_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+#else
+    RawSocket sock(IPPROTO_TCP);
+    int recv_sock = sock.fd();
+    int optval = 1;
+    setsockopt(recv_sock, IPPROTO_IP, IP_HDRINCL, &optval, sizeof(optval));
+#endif
 
     uint8_t buf[65535];
     sockaddr_in src{};
     socklen_t slen = sizeof(src);
-    fd_set rfds; FD_ZERO(&rfds); FD_SET(sock.fd(), &rfds);
+    fd_set rfds; FD_ZERO(&rfds); FD_SET(recv_sock, &rfds);
     timeval tv{1, 0};
-    if (select(sock.fd() + 1, &rfds, nullptr, nullptr, &tv) > 0) {
-        ssize_t n = recvfrom(sock.fd(), buf, sizeof(buf), 0,
+    if (select(recv_sock + 1, &rfds, nullptr, nullptr, &tv) > 0) {
+        ssize_t n = recvfrom(recv_sock, buf, sizeof(buf), 0,
                              reinterpret_cast<sockaddr*>(&src), &slen);
         if (n > 0) {
+            // parse headers
+            const struct ip* iphdr = reinterpret_cast<const struct ip*>(buf);
+            int iplen = iphdr->ip_hl * 4;
+            if (iphdr->ip_p != IPPROTO_TCP || n < iplen + sizeof(tcphdr)) {
+                // Not TCP or too short
+                goto after_fingerprint_recv;
+            }
+            const struct tcphdr* tcph = reinterpret_cast<const struct tcphdr*>(buf + iplen);
+            // match ports and flags
+            if (ntohs(tcph->th_sport) != open_port ||
+                ntohs(tcph->th_dport) != src_port ||
+                (tcph->th_flags & (TH_SYN|TH_ACK)) != (TH_SYN|TH_ACK)) {
+                goto after_fingerprint_recv;
+            }
             OSFingerprint fp{};
             if (analyze_syn_ack(buf, n, fp)) {
                 target_os = fp;
@@ -776,6 +878,10 @@ void PortScanner::fingerprint_os(uint16_t open_port) {
             }
         }
     }
+after_fingerprint_recv:
+#ifdef __linux__
+    if (recv_sock >= 0) close(recv_sock);
+#endif
     // If still not detected, try ICMP echo to read TTL
     if (!os_detected) {
         int icmp = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -885,9 +991,13 @@ void PortScanner::sniff_port(uint16_t port, int duration_sec) {
     std::cout << "--- Finished sniffing port " << port << " ---\n";
     log_file << "--- Finished sniffing port " << port << " ---\n";
     return;
-    #endif
+#endif
 #ifndef __APPLE__
+    #ifdef __linux__
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    #else
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
+    #endif
     if (sock < 0) {
         perror("raw socket");
         return;
@@ -969,3 +1079,13 @@ void PortScanner::sniff_open_ports(int duration_sec) {
 //   - On macOS, use libpcap (pcap_open_live) to capture packets (since raw sockets can't sniff).
 //   - You may need root privileges for raw sockets or pcap.
 //   - Consider using tcpdump/wireshark/pcap APIs for advanced sniffing.
+void PortScanner::send_raw_payload(uint16_t port, const std::vector<uint8_t>& data) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return;
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port);
+    inet_pton(AF_INET, target_ip.c_str(), &a.sin_addr);
+    if (connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
+        send(s, data.data(), data.size(), 0);
+    }
+    close(s);
+}
