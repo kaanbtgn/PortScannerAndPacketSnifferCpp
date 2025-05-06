@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <sys/types.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <iomanip>
@@ -92,11 +93,30 @@ struct ScanResult {
 
 // TTL-based OS guess helper
 std::string guess_os_by_ttl(uint8_t ttl) {
-    if (ttl >= 128) return "Windows/Embedded";
-    if (ttl >= 100) return "FreeBSD/OpenBSD";
-    if (ttl >= 64)  return "Linux/macOS";
-    if (ttl >= 32)  return "Older Linux";
+    if (ttl >= 100) return "Windows/Embedded";
+    if (ttl >= 90)  return "FreeBSD/OpenBSD";
+    if (ttl >= 60)  return "Linux/macOS";
+    if (ttl > 0)    return "Linux/macOS (many hops)";
     return "Unknown OS";
+}
+// Needed for popen/pclose fallback ping
+#include <cstdio>
+#include <cstdlib>
+
+// Resolve a hostname to IPv4 string; returns original input if resolution fails
+std::string resolve_hostname(const std::string& host) {
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;        // IPv4 only
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+        return host;                  // return unchanged on failure
+    }
+    char ipstr[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET,
+              &reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr,
+              ipstr, sizeof(ipstr));
+    freeaddrinfo(res);
+    return std::string(ipstr);
 }
 
 class PortScanner {
@@ -701,6 +721,8 @@ int main(int argc, char* argv[]) {
         if (argc > 3) end_port = std::stoi(argv[3]);
         if (argc > 4) sniff_duration = std::stoi(argv[4]);
     }
+    // Resolve hostname to IP if needed
+    target_ip = resolve_hostname(target_ip);
     PortScanner scanner(target_ip);
     if (mode == "tcp" || mode == "both") {
         scanner.scan_ports(start_port, end_port, 100);
@@ -781,6 +803,29 @@ void PortScanner::fingerprint_os(uint16_t open_port) {
                 log_file << "[!] TTL‑based guess: " << g << " (TTL=" << (int)ttl << ")\n";
             }
             close(icmp);
+        }
+    }
+    // If still not detected, try system ping and parse TTL
+    if (!os_detected) {
+        std::string cmd = "ping -c1 -W1 " + target_ip;
+        FILE* f = popen(cmd.c_str(), "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                char* p = strstr(line, "ttl=");
+                if (p) {
+                    int ttl = atoi(p + 4);
+                    if (ttl > 0) {
+                        target_os.ttl = ttl;
+                        os_detected = true;
+                        std::string g = guess_os_by_ttl(ttl);
+                        std::cout << "[!] Ping TTL-based guess: " << g << " (TTL=" << ttl << ")\n";
+                        log_file << "[!] Ping TTL-based guess: " << g << " (TTL=" << ttl << ")\n";
+                    }
+                    break;
+                }
+            }
+            pclose(f);
         }
     }
 }
